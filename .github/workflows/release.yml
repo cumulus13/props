@@ -2,79 +2,62 @@ name: Build & Release
 
 on:
   push:
-    branches: ["**"]
     tags:
       - "v*.*.*"
-  pull_request:
-
+  
 permissions:
   contents: write
 
 env:
   GONOSUMDB: "*"
-  GOPROXY: "https://proxy.golang.org,direct"
+  GOFLAGS: ""
 
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
-  # Lint — cross-compiled to windows so //go:build windows is included
-  # ────────────────────────────────────────────────────────────────────────────
-  # lint:
-  #   name: Lint
-  #   runs-on: ubuntu-latest
-
-  #   steps:
-  #     - uses: actions/checkout@v4
-
-  #     - uses: actions/setup-go@v5
-  #       with:
-  #         go-version: "1.22"
-  #         cache: false
-
-  #     - name: Tidy
-  #       run: go mod tidy
-
-  #     - name: golangci-lint
-  #       uses: golangci/golangci-lint-action@v6
-  #       with:
-  #         version: v1.64.8
-  #       env:
-  #         GOOS: windows
-  #         GOARCH: amd64
-
-  # ────────────────────────────────────────────────────────────────────────────
-  # Build — windows only (//go:build windows in source)
+  # Build all platform binaries in parallel
   # ────────────────────────────────────────────────────────────────────────────
   build:
-    name: Build (${{ matrix.goarch }})
+    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
     runs-on: ubuntu-latest
 
     strategy:
       fail-fast: false
       matrix:
         include:
-          - goarch: amd64
+          - goos: windows
+            goarch: amd64
             output: props-windows-amd64.exe
-          - goarch: "386"
+          - goos: windows
+            goarch: "386"
             output: props-windows-386.exe
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
           go-version: "1.22"
-          cache: false
+          cache: false   # disable cache — let go mod tidy handle deps fresh
 
-      - name: Tidy & verify
+      - name: Tidy & verify dependencies
+        # go mod tidy regenerates go.sum completely using proxy.golang.org
+        # GONOSUMDB=* skips sum.golang.org verification (not needed for open source deps)
         run: |
           go mod tidy
           go mod verify
+        env:
+          GONOSUMDB: "*"
+          GOPROXY: "https://proxy.golang.org,direct"
 
       - name: Build
         env:
-          GOOS: windows
+          GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
+          GONOSUMDB: "*"
+          GOPROXY: "https://proxy.golang.org,direct"
         run: |
           mkdir -p dist
           go build \
@@ -89,19 +72,19 @@ jobs:
         with:
           name: ${{ matrix.output }}
           path: dist/${{ matrix.output }}
-          retention-days: 7
+          retention-days: 1
 
   # ────────────────────────────────────────────────────────────────────────────
-  # Release — only on version tags
+  # Create GitHub Release and attach all binaries
   # ────────────────────────────────────────────────────────────────────────────
   release:
     name: Release
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -115,22 +98,25 @@ jobs:
         working-directory: dist
         run: |
           sha256sum * > checksums.txt
+          echo "=== checksums.txt ==="
           cat checksums.txt
 
       - name: Extract changelog for this tag
+        id: changelog
         run: |
           TAG="${{ github.ref_name }}"
-          NOTES=""
           if [ -f CHANGELOG.md ]; then
             NOTES=$(awk "/^## \[?${TAG//v/}\]?/{flag=1; next} /^## /{flag=0} flag" CHANGELOG.md)
           fi
-          [ -z "$NOTES" ] && NOTES="Release ${TAG}"
+          if [ -z "$NOTES" ]; then
+            NOTES="Release ${TAG}"
+          fi
           echo "$NOTES" > /tmp/release_notes.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: "props ${{ github.ref_name }}"
+          name: "props-go ${{ github.ref_name }}"
           body_path: /tmp/release_notes.md
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
@@ -138,3 +124,5 @@ jobs:
             dist/props-windows-amd64.exe
             dist/props-windows-386.exe
             dist/checksums.txt
+
+  
