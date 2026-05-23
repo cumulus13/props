@@ -1,0 +1,147 @@
+name: Build & Release
+
+on:
+  push:
+    branches: ["**"]
+    tags:
+      - "v*.*.*"
+  pull_request:
+
+permissions:
+  contents: write
+
+env:
+  GONOSUMDB: "*"
+  GOPROXY: "https://proxy.golang.org,direct"
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # Lint (Linux only — windows-only build tag is fine, vet with GOOS=windows)
+  # ────────────────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+
+      - name: Tidy
+        run: go mod tidy
+
+      - name: Vet (cross-compiled to windows)
+        run: GOOS=windows GOARCH=amd64 go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: >
+            --timeout=5m
+            --enable=govet,errcheck,staticcheck,unused,gosimple,ineffassign
+        env:
+          GOOS: windows
+          GOARCH: amd64
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Build — windows only (//go:build windows in source)
+  # ────────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build (${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            output: props-windows-amd64.exe
+          - goarch: "386"
+            output: props-windows-386.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+
+      - name: Tidy & verify
+        run: |
+          go mod tidy
+          go mod verify
+
+      - name: Build
+        env:
+          GOOS: windows
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist
+          go build \
+            -ldflags="-s -w \
+              -X main.version=${{ github.ref_name }} \
+              -X 'main.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)' \
+              -X main.commit=${{ github.sha }}" \
+            -o dist/${{ matrix.output }} .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.output }}
+          path: dist/${{ matrix.output }}
+          retention-days: 7
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Release — only on version tags
+  # ────────────────────────────────────────────────────────────────────────────
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        run: |
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Extract changelog for this tag
+        id: changelog
+        run: |
+          TAG="${{ github.ref_name }}"
+          NOTES=""
+          if [ -f CHANGELOG.md ]; then
+            NOTES=$(awk "/^## \[?${TAG//v/}\]?/{flag=1; next} /^## /{flag=0} flag" CHANGELOG.md)
+          fi
+          [ -z "$NOTES" ] && NOTES="Release ${TAG}"
+          echo "$NOTES" > /tmp/release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "props ${{ github.ref_name }}"
+          body_path: /tmp/release_notes.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            dist/props-windows-amd64.exe
+            dist/props-windows-386.exe
+            dist/checksums.txt
