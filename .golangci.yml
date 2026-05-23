@@ -1,15 +1,11 @@
-# golangci-lint v2 config
-# https://golangci-lint.run/docs/configuration/file/
-
-version: "2"
-
+# golangci-lint v1 config (v1.64.x)
 linters:
-  default: none
+  disable-all: true
   enable:
     - errcheck
     - govet
     - ineffassign
-    - staticcheck  # includes gosimple + unused in v2
+    - staticcheck
     - unused
 
 issues:
