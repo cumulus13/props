@@ -4,12 +4,6 @@
 // Author  : Hadi Cahyadi <cumulus13@gmail.com>
 // Homepage: https://github.com/cumulus13/props
 // License : MIT
-//
-// The Properties dialog requires the calling process to stay alive.
-// We run a Windows message loop so the process keeps running while
-// the dialog is open, then exits cleanly when the dialog is closed.
-// The terminal prompt returns immediately because we re-launch ourselves
-// as a detached background process.
 
 package main
 
@@ -18,30 +12,29 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
-// ── Win32 types ──────────────────────────────────────────────────────────────
-
 type shellExecuteInfo struct {
-	cbSize         uint32
-	fMask          uint32
-	hwnd           uintptr
-	lpVerb         *uint16
-	lpFile         *uint16
-	lpParameters   *uint16
-	lpDirectory    *uint16
-	nShow          int32
-	hInstApp       uintptr
-	lpIDList       uintptr
-	lpClass        *uint16
-	hkeyClass      uintptr
-	dwHotKey       uint32
-	hMonitor       uintptr
-	hProcess       uintptr
+	cbSize       uint32
+	fMask        uint32
+	hwnd         uintptr
+	lpVerb       *uint16
+	lpFile       *uint16
+	lpParameters *uint16
+	lpDirectory  *uint16
+	nShow        int32
+	hInstApp     uintptr
+	lpIDList     uintptr
+	lpClass      *uint16
+	hkeyClass    uintptr
+	dwHotKey     uint32
+	hMonitor     uintptr
+	hProcess     uintptr
 }
 
-type msg struct {
+type winMsg struct {
 	hwnd    uintptr
 	message uint32
 	wParam  uintptr
@@ -51,24 +44,21 @@ type msg struct {
 }
 
 const (
-	seeMaskInvokeIDList  uint32 = 0x0000000C
-	seeMaskNoCloseProcess uint32 = 0x00000040
-	swShow               int32  = 1
-	wmQuit               uint32 = 0x0012
+	seeMaskInvokeIDList uint32 = 0x0000000C
+	swShow              int32  = 1
+	pmNoRemove          uint32 = 0x0000
 )
 
 var (
-	shell32         = syscall.NewLazyDLL("shell32.dll")
-	user32          = syscall.NewLazyDLL("user32.dll")
+	shell32        = syscall.NewLazyDLL("shell32.dll")
+	user32         = syscall.NewLazyDLL("user32.dll")
 	procShellExecEx = shell32.NewProc("ShellExecuteExW")
-	procGetMessage  = user32.NewProc("GetMessageW")
+	procPeekMessage = user32.NewProc("PeekMessageW")
 	procDispatch    = user32.NewProc("DispatchMessageW")
 	procTranslate   = user32.NewProc("TranslateMessage")
-	procWaitForSingleObject = syscall.NewLazyDLL("kernel32.dll").NewProc("WaitForSingleObject")
-	procCloseHandle         = syscall.NewLazyDLL("kernel32.dll").NewProc("CloseHandle")
+	procIsWindow    = user32.NewProc("IsWindow")
+	procFindWindow  = user32.NewProc("FindWindowW")
 )
-
-// ── showProperties ────────────────────────────────────────────────────────────
 
 func showProperties(target string) error {
 	abs, err := filepath.Abs(target)
@@ -80,7 +70,7 @@ func showProperties(target string) error {
 	file, _ := syscall.UTF16PtrFromString(abs)
 
 	sei := shellExecuteInfo{
-		fMask:  seeMaskInvokeIDList | seeMaskNoCloseProcess,
+		fMask:  seeMaskInvokeIDList,
 		lpVerb: verb,
 		lpFile: file,
 		nShow:  swShow,
@@ -92,56 +82,63 @@ func showProperties(target string) error {
 		return fmt.Errorf("ShellExecuteEx failed: %w", lastErr)
 	}
 
-	// hProcess is set because of SEE_MASK_NOCLOSEPROCESS.
-	// Wait for the Properties dialog process/thread to finish,
-	// then close the handle.
-	if sei.hProcess != 0 {
-		procWaitForSingleObject.Call(sei.hProcess, 0xFFFFFFFF) // INFINITE
-		procCloseHandle.Call(sei.hProcess)
-	} else {
-		// Fallback: pump a message loop until WM_QUIT
-		// (handles cases where hProcess is not returned)
-		var m msg
-		for {
-			r, _, _ := procGetMessage.Call(
-				uintptr(unsafe.Pointer(&m)), 0, 0, 0,
+	// Pump messages briefly to let the shell open the dialog,
+	// then keep pumping while the properties window is alive.
+	// We detect the dialog by watching for the shell's property sheet
+	// class name "#32770" (standard dialog box).
+	var m winMsg
+
+	// Give shell time to create the window
+	time.Sleep(500 * time.Millisecond)
+
+	// Find the properties dialog window — class "#32770"
+	cls, _ := syscall.UTF16PtrFromString("#32770")
+	hwnd, _, _ := procFindWindow.Call(uintptr(unsafe.Pointer(cls)), 0)
+
+	if hwnd == 0 {
+		// Fallback: pump for 30 seconds max
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			ret, _, _ := procPeekMessage.Call(
+				uintptr(unsafe.Pointer(&m)), 0, 0, 0, 1,
 			)
-			if r == 0 || r == ^uintptr(0) { // 0=WM_QUIT, -1=error
-				break
+			if ret != 0 {
+				_, _, _ = procTranslate.Call(uintptr(unsafe.Pointer(&m)))
+				_, _, _ = procDispatch.Call(uintptr(unsafe.Pointer(&m)))
 			}
-			procTranslate.Call(uintptr(unsafe.Pointer(&m)))
-			procDispatch.Call(uintptr(unsafe.Pointer(&m)))
+			time.Sleep(100 * time.Millisecond)
 		}
+		return nil
 	}
+
+	// Wait until that window is destroyed
+	for {
+		r, _, _ := procIsWindow.Call(hwnd)
+		if r == 0 {
+			break
+		}
+		ret, _, _ := procPeekMessage.Call(
+			uintptr(unsafe.Pointer(&m)), 0, 0, 0, 1,
+		)
+		if ret != 0 {
+			_, _, _ = procTranslate.Call(uintptr(unsafe.Pointer(&m)))
+			_, _, _ = procDispatch.Call(uintptr(unsafe.Pointer(&m)))
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
 	return nil
 }
 
-// ── relaunch as detached background process ───────────────────────────────────
-// This gives the terminal its prompt back immediately while our process
-// keeps running in the background waiting for the dialog to close.
-
 func relaunchDetached() {
-	// Build arg list with a sentinel so the child knows not to re-relaunch
 	args := append([]string{"--worker"}, os.Args[1:]...)
 	exe, _ := os.Executable()
-
-	cmd := &syscall.StartupInfo{}
+	si := &syscall.StartupInfo{}
 	pi := &syscall.ProcessInformation{}
-	cmdLine, _ := syscall.UTF16PtrFromString(
-		syscall.EscapeArg(exe) + " " + joinArgs(args),
-	)
+	cmdLine, _ := syscall.UTF16PtrFromString(syscall.EscapeArg(exe) + " " + joinArgs(args))
 	exePtr, _ := syscall.UTF16PtrFromString(exe)
-
-	syscall.CreateProcess(
-		exePtr,
-		cmdLine,
-		nil, nil, false,
-		// DETACHED_PROCESS | CREATE_NO_WINDOW
-		0x00000008|0x08000000,
-		nil, nil,
-		cmd, pi,
-	)
-	// Parent exits immediately → terminal gets prompt back
+	_ = syscall.CreateProcess(exePtr, cmdLine, nil, nil, false,
+		0x00000008|0x08000000, nil, nil, si, pi)
 }
 
 func joinArgs(args []string) string {
@@ -154,8 +151,6 @@ func joinArgs(args []string) string {
 	}
 	return out
 }
-
-// ── usage ─────────────────────────────────────────────────────────────────────
 
 func usage() {
 	name := filepath.Base(os.Args[0])
@@ -170,8 +165,6 @@ func usage() {
 	fmt.Fprintf(os.Stderr, "  %s . ..\n", name)
 }
 
-// ── main ──────────────────────────────────────────────────────────────────────
-
 func main() {
 	args := os.Args[1:]
 
@@ -183,7 +176,6 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Worker mode: we are the background process — open dialogs and wait.
 	if args[0] == "--worker" {
 		args = args[1:]
 		exitCode := 0
@@ -196,6 +188,5 @@ func main() {
 		os.Exit(exitCode)
 	}
 
-	// Launcher mode: re-launch as detached worker, then exit immediately.
 	relaunchDetached()
 }

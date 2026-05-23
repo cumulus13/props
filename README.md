@@ -19,7 +19,9 @@ Exactly like right-clicking something in Explorer and choosing **Properties** â€
 ## Build
 
 ```bat
-build.bat
+# You have to build it yourself, don't use *.bat files!
+
+go build -ldflags "-s -w" -o props.exe .
 ```
 
 Or with Make:
