@@ -16,7 +16,7 @@ env:
 
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
-  # Lint (Linux only — windows-only build tag is fine, vet with GOOS=windows)
+  # Lint — cross-compiled to windows so //go:build windows is included
   # ────────────────────────────────────────────────────────────────────────────
   lint:
     name: Lint
@@ -33,16 +33,10 @@ jobs:
       - name: Tidy
         run: go mod tidy
 
-      - name: Vet (cross-compiled to windows)
-        run: GOOS=windows GOARCH=amd64 go vet ./...
-
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
           version: latest
-          args: >
-            --timeout=5m
-            --enable=govet,errcheck,staticcheck,unused,gosimple,ineffassign
         env:
           GOOS: windows
           GOARCH: amd64
@@ -124,7 +118,6 @@ jobs:
           cat checksums.txt
 
       - name: Extract changelog for this tag
-        id: changelog
         run: |
           TAG="${{ github.ref_name }}"
           NOTES=""
