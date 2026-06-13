@@ -44,21 +44,70 @@ type winMsg struct {
 }
 
 const (
-	seeMaskInvokeIDList uint32 = 0x0000000C
-	swShow              int32  = 1
-	pmNoRemove          uint32 = 0x0000
+	// This exact combination (INVOKEIDLIST | NOCLOSEPROCESS, lpFile set,
+	// no lpIDList, no NOASYNC) is the one that actually showed the
+	// Properties dialog.
+	seeMaskInvokeIDList   uint32 = 0x0000000C
+	seeMaskNoCloseProcess uint32 = 0x00000040
+	swShow                int32  = 1
+	pmRemove              uint32 = 0x0001
 )
 
 var (
-	shell32        = syscall.NewLazyDLL("shell32.dll")
-	user32         = syscall.NewLazyDLL("user32.dll")
-	procShellExecEx = shell32.NewProc("ShellExecuteExW")
-	procPeekMessage = user32.NewProc("PeekMessageW")
-	procDispatch    = user32.NewProc("DispatchMessageW")
-	procTranslate   = user32.NewProc("TranslateMessage")
-	procIsWindow    = user32.NewProc("IsWindow")
-	procFindWindow  = user32.NewProc("FindWindowW")
+	kernel32 = syscall.NewLazyDLL("kernel32.dll")
+	shell32  = syscall.NewLazyDLL("shell32.dll")
+	user32   = syscall.NewLazyDLL("user32.dll")
+
+	procShellExecEx        = shell32.NewProc("ShellExecuteExW")
+	procEnumWindows        = user32.NewProc("EnumWindows")
+	procGetClassName       = user32.NewProc("GetClassNameW")
+	procGetWindowThreadPid = user32.NewProc("GetWindowThreadProcessId")
+	procIsWindowVisible    = user32.NewProc("IsWindowVisible")
+	procIsWindow           = user32.NewProc("IsWindow")
+	procPeekMessage        = user32.NewProc("PeekMessageW")
+	procTranslateMessage   = user32.NewProc("TranslateMessage")
+	procDispatchMessage    = user32.NewProc("DispatchMessageW")
+	procGetCurrentProcId   = kernel32.NewProc("GetCurrentProcessId")
+	procCloseHandle        = kernel32.NewProc("CloseHandle")
 )
+
+func pumpMessages() {
+	var m winMsg
+	for {
+		ret, _, _ := procPeekMessage.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0, uintptr(pmRemove))
+		if ret == 0 {
+			break
+		}
+		_, _, _ = procTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
+		_, _, _ = procDispatchMessage.Call(uintptr(unsafe.Pointer(&m)))
+	}
+}
+
+// findOwnDialog returns the HWND of a visible "#32770" dialog window
+// owned by the given PID, or 0 if none exists yet.
+func findOwnDialog(pid uint32) uintptr {
+	var found uintptr
+	cb := syscall.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
+		var winPid uint32
+		_, _, _ = procGetWindowThreadPid.Call(hwnd, uintptr(unsafe.Pointer(&winPid)))
+		if winPid != pid {
+			return 1
+		}
+		visible, _, _ := procIsWindowVisible.Call(hwnd)
+		if visible == 0 {
+			return 1
+		}
+		buf := make([]uint16, 256)
+		_, _, _ = procGetClassName.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+		if syscall.UTF16ToString(buf) == "#32770" {
+			found = hwnd
+			return 0
+		}
+		return 1
+	})
+	_, _, _ = procEnumWindows.Call(cb, 0)
+	return found
+}
 
 func showProperties(target string) error {
 	abs, err := filepath.Abs(target)
@@ -70,7 +119,7 @@ func showProperties(target string) error {
 	file, _ := syscall.UTF16PtrFromString(abs)
 
 	sei := shellExecuteInfo{
-		fMask:  seeMaskInvokeIDList,
+		fMask:  seeMaskInvokeIDList | seeMaskNoCloseProcess,
 		lpVerb: verb,
 		lpFile: file,
 		nShow:  swShow,
@@ -79,52 +128,42 @@ func showProperties(target string) error {
 
 	r, _, lastErr := procShellExecEx.Call(uintptr(unsafe.Pointer(&sei)))
 	if r == 0 {
-		return fmt.Errorf("ShellExecuteEx failed: %w", lastErr)
+		return fmt.Errorf("ShellExecuteEx failed (hInstApp=%d): %w", sei.hInstApp, lastErr)
 	}
 
-	// Pump messages briefly to let the shell open the dialog,
-	// then keep pumping while the properties window is alive.
-	// We detect the dialog by watching for the shell's property sheet
-	// class name "#32770" (standard dialog box).
-	var m winMsg
+	// Close hProcess handle if we got one — we don't use it for waiting
+	// since it doesn't correspond to the dialog's lifetime.
+	if sei.hProcess != 0 {
+		_, _, _ = procCloseHandle.Call(sei.hProcess)
+	}
 
-	// Give shell time to create the window
-	time.Sleep(500 * time.Millisecond)
+	pid, _, _ := procGetCurrentProcId.Call()
 
-	// Find the properties dialog window — class "#32770"
-	cls, _ := syscall.UTF16PtrFromString("#32770")
-	hwnd, _, _ := procFindWindow.Call(uintptr(unsafe.Pointer(cls)), 0)
-
-	if hwnd == 0 {
-		// Fallback: pump for 30 seconds max
-		deadline := time.Now().Add(30 * time.Second)
-		for time.Now().Before(deadline) {
-			ret, _, _ := procPeekMessage.Call(
-				uintptr(unsafe.Pointer(&m)), 0, 0, 0, 1,
-			)
-			if ret != 0 {
-				_, _, _ = procTranslate.Call(uintptr(unsafe.Pointer(&m)))
-				_, _, _ = procDispatch.Call(uintptr(unsafe.Pointer(&m)))
-			}
-			time.Sleep(100 * time.Millisecond)
+	// Poll for our own "#32770" dialog window for up to 5s, pumping
+	// messages so it can actually be created.
+	var dlg uintptr
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		pumpMessages()
+		dlg = findOwnDialog(uint32(pid))
+		if dlg != 0 {
+			break
 		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if dlg == 0 {
 		return nil
 	}
 
-	// Wait until that window is destroyed
+	// Wait until the dialog window is closed.
 	for {
-		r, _, _ := procIsWindow.Call(hwnd)
-		if r == 0 {
+		exists, _, _ := procIsWindow.Call(dlg)
+		if exists == 0 {
 			break
 		}
-		ret, _, _ := procPeekMessage.Call(
-			uintptr(unsafe.Pointer(&m)), 0, 0, 0, 1,
-		)
-		if ret != 0 {
-			_, _, _ = procTranslate.Call(uintptr(unsafe.Pointer(&m)))
-			_, _, _ = procDispatch.Call(uintptr(unsafe.Pointer(&m)))
-		}
-		time.Sleep(100 * time.Millisecond)
+		pumpMessages()
+		time.Sleep(50 * time.Millisecond)
 	}
 
 	return nil
